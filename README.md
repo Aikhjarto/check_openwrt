@@ -27,6 +27,7 @@ standard library.
 | `wireguard` | handshake age of selected peers (`-P`, `-a`) in seconds, traffic counters | `-w 300 -c 900` |
 | `services`  | procd service instances are running                                 | dead daemon: CRITICAL, failed one-shot job: WARNING |
 | `updates`   | number of upgradable packages (`opkg` or `apk`)                     | `-w 0`             |
+| `inet`      | internet access from the device: DNS lookup, ping and HTTP(S) fetch | `-w 200,20% -c 500,60%` (ping) |
 
 Thresholds use the standard
 [range format](https://www.monitoring-plugins.org/doc/guidelines.html#THRESHOLDFORMAT):
@@ -100,7 +101,8 @@ check_openwrt -H HOST [-l USER] [-p PORT] [-i KEYFILE] [-o SSH_OPTION]
 ```
 
 `check_openwrt --help` and `check_openwrt CHECK --help` list all options.
-The default timeout is 10 seconds, and 60 seconds for `updates`.
+The default timeout is 10 seconds, 60 seconds for `updates` and the sum of
+the enabled test timeouts for `inet` (30 seconds with the defaults).
 
 Examples:
 
@@ -113,6 +115,8 @@ check_openwrt -H router.example.org wifi -x radio2
 check_openwrt -H router.example.org wireguard -P "office" -P "xyzKEY...="
 check_openwrt -H router.example.org services -s dnsmasq -s dropbear
 check_openwrt -H router.example.org updates
+check_openwrt -H router.example.org inet
+check_openwrt -H router.example.org inet -A 2001:db8::1 -U https://example.org/ --no-dns
 ```
 
 Example output:
@@ -146,6 +150,23 @@ OPENWRT WIFI OK - 2 radios up, 0 disabled, 6 clients | clients_phy0-ap0=4;;;0 cl
   this check rarely, e.g. once a day. Note that upgrading individual packages
   is usually not recommended on OpenWrt; many available updates often mean a
   new point release is available for sysupgrade.
+* **inet**: runs three tests on the device, so it checks the device's own
+  internet access, independent of the monitoring server's connection:
+  * DNS: looks up `-D` (default `openwrt.org`) with `nslookup` through the
+    device's resolver, or through `-S`. Failure is CRITICAL.
+  * ping: sends `--packets` (default 3) pings to `-A` (default `9.9.9.9`).
+    `-w`/`-c` take round trip average in ms and packet loss in percent,
+    like `check_ping`. If the ping is CRITICAL but the HTTP(S) fetch works,
+    the result is only WARNING, as some networks block ICMP.
+  * HTTP(S): fetches `-U` (default `https://downloads.openwrt.org/`) with
+    `uclient-fetch`, timeout `--http-timeout` (default 10 s). Failure is
+    CRITICAL and shows the reason, e.g. an expired certificate (which can
+    also mean the device's clock is wrong) or an HTTP error code. HTTPS
+    needs a TLS library for uclient-fetch (`libustream-*`), which is part of
+    the default images since OpenWrt 21.02.
+
+  Each test can be skipped with `--no-dns`, `--no-ping` or `--no-http`.
+  Performance data: `dns_time`, `rta`, `pl` and `http_time`.
 
 ## Naemon / Nagios configuration example
 

@@ -17,7 +17,7 @@ import re
 import subprocess
 import sys
 
-__version__ = "0.2"
+__version__ = "0.3"
 
 OK, WARNING, CRITICAL, UNKNOWN = 0, 1, 2, 3
 STATE_NAMES = {OK: "OK", WARNING: "WARNING", CRITICAL: "CRITICAL", UNKNOWN: "UNKNOWN"}
@@ -557,6 +557,138 @@ def check_updates(out: str, args) -> Result:
     return res
 
 
+def parse_ping_thresholds(value: str) -> list[Range]:
+    """check_ping style thresholds "RTA,LOSS%", e.g. "200,20%"."""
+    parts = value.split(",")
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError("expected round trip average and packet loss, "
+                                         "e.g. 200,20%")
+    return [Range(parts[0]), Range(parts[1].rstrip("%"))]
+
+
+def inet_timeout(args) -> int:
+    """Upper bound for the run time of all enabled inet tests."""
+    timeout = 5
+    if not args.no_dns:
+        timeout += 10
+    if not args.no_ping:
+        timeout += args.packets + 2
+    if not args.no_http:
+        timeout += args.http_timeout
+    return timeout
+
+
+def script_inet(args) -> str:
+    if args.no_dns and args.no_ping and args.no_http:
+        raise CheckError("all tests are disabled")
+    if args.packets < 1:
+        raise CheckError("--packets must be at least 1")
+    # /proc/uptime has a resolution of 10 ms, BusyBox date only full seconds
+    lines = ["up() { cut -d' ' -f1 /proc/uptime; }"]
+    if not args.no_dns:
+        server = " " + shell_quote(args.dns_server) if args.dns_server else ""
+        lines.append("echo @@dns@@; t=$(up); nslookup -timeout=5 -retry=1 "
+                     f"{shell_quote(args.dns_name)}{server} 2>&1; "
+                     "echo \"@@dns-rc $? $t $(up)@@\"")
+    if not args.no_ping:
+        lines.append(f"echo @@ping@@; ping -q -c {args.packets} -W 1 -w {args.packets + 2} "
+                     f"{shell_quote(args.address)} 2>&1; echo \"@@ping-rc $?@@\"")
+    if not args.no_http:
+        lines.append(f"echo @@http@@; t=$(up); uclient-fetch -T {args.http_timeout} "
+                     f"-O /dev/null {shell_quote(args.url)} 2>&1; "
+                     "echo \"@@http-rc $? $t $(up)@@\"")
+    return "\n".join(lines)
+
+
+def inet_result(parts: dict[str, str], name: str) -> tuple[str, int, float]:
+    """Output, exit code and run time of one inet test."""
+    for key in parts:
+        fields = key.split()
+        if fields and fields[0] == f"{name}-rc":
+            try:
+                code = int(fields[1])
+                duration = float(fields[3]) - float(fields[2]) if len(fields) == 4 else 0.0
+            except (ValueError, IndexError):
+                break
+            return parts.get(name, ""), code, max(duration, 0.0)
+    raise CheckError(f"no result of the {name} test")
+
+
+def error_lines(text: str) -> str:
+    lines = [line.strip().lstrip(";").strip() for line in text.splitlines() if line.strip()]
+    errors = [line for line in lines if re.search(r"error|fail|can't|bad address", line, re.I)]
+    unique = list(dict.fromkeys(errors))
+    return "; ".join(unique) or (lines[-1] if lines else "no output")
+
+
+def check_inet(out: str, args) -> Result:
+    parts = sections(out)
+    res = Result()
+    problems = []
+    oks = []
+
+    def report(state: int, text: str, detail: str = "") -> None:
+        res.set(state)
+        (oks if state == OK else problems).append(text)
+        res.details.append(f"[{STATE_NAMES[state]}] {detail or text}")
+
+    # HTTP is evaluated first: a failing ping is only a warning if HTTP works
+    http = None
+    if not args.no_http:
+        text, code, duration = inet_result(parts, "http")
+        kind = "HTTPS" if args.url.lower().startswith("https:") else "HTTP"
+        if code == 0:
+            http = (OK, f"{kind} {duration:.2f} s",
+                    f"{kind} {args.url} fetched in {duration:.2f} s")
+            res.perf("http_time", round(duration, 2), "s", "", "", 0)
+        else:
+            reason = error_lines(text)
+            http = (CRITICAL, f"{kind} failed: {reason}", f"{kind} {args.url} failed: {reason}")
+
+    if not args.no_dns:
+        text, code, duration = inet_result(parts, "dns")
+        _, _, answer = text.partition("Name:")
+        addresses = list(dict.fromkeys(
+            re.findall(r"^Address(?: \d+)?:\s+(\S+)\s*$", answer, re.M)))
+        if code == 0 and addresses:
+            report(OK, f"DNS {duration:.2f} s",
+                   f"DNS {args.dns_name}: {', '.join(addresses)} ({duration:.2f} s)")
+            res.perf("dns_time", round(duration, 2), "s", "", "", 0)
+        else:
+            reason = error_lines(text) if code else "no addresses"
+            reason = re.sub(r"\*\* server can't find [^:]+: ", "", reason)
+            report(CRITICAL, f"DNS lookup of {args.dns_name} failed: {reason}")
+
+    if not args.no_ping:
+        text, code, _ = inet_result(parts, "ping")
+        match = re.search(r"(\d+) packets transmitted, (\d+) packets received", text)
+        if not match:
+            report(CRITICAL, f"ping {args.address} failed: {error_lines(text)}")
+        else:
+            sent, received = int(match.group(1)), int(match.group(2))
+            loss = 100.0 * (sent - received) / sent if sent else 100.0
+            warn_rta, warn_loss = args.warning
+            crit_rta, crit_loss = args.critical
+            state = evaluate(loss, warn_loss, crit_loss)
+            summary = f"ping {args.address} {loss:.0f}% loss"
+            rtt = re.search(r"min/avg/max = [\d.]+/([\d.]+)/", text)
+            if rtt:
+                rta = float(rtt.group(1))
+                state = worst(state, evaluate(rta, warn_rta, crit_rta))
+                summary += f", rta {rta:.1f} ms"
+                res.perf("rta", rta, "ms", warn_rta, crit_rta, 0)
+            res.perf("pl", round(loss), "%", warn_loss, crit_loss, 0, 100)
+            if state == CRITICAL and http and http[0] == OK:
+                state = WARNING  # ICMP may be blocked while the internet works
+                summary += " (HTTP works)"
+            report(state, summary)
+
+    if http:
+        report(*http)
+    res.summary = ", ".join(problems) if problems else "internet access: " + ", ".join(oks)
+    return res
+
+
 CHECKS = {
     "mem": (script_mem, check_mem, "memory usage in percent", "80", "90"),
     "disk": (script_disk, check_disk, "disk usage in percent (default /overlay)", "80", "90"),
@@ -570,6 +702,8 @@ CHECKS = {
                   "300", "900"),
     "services": (script_services, check_services, "procd service instances are running", "", ""),
     "updates": (script_updates, check_updates, "number of upgradable packages", "0", ""),
+    "inet": (script_inet, check_inet, "internet access from the device: DNS, ping and HTTP(S)",
+             "200,20%", "500,60%"),
 }
 
 
@@ -617,18 +751,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-o", "--ssh-option", action="append", metavar="OPTION",
                         help="extra ssh -o option, can be given multiple times")
     parser.add_argument("-t", "--timeout", type=int,
-                        help="timeout in seconds (default: 10, 60 for updates)")
+                        help="timeout in seconds (default: 10, 60 for updates, "
+                             "sum of the test timeouts for inet)")
     parser.add_argument("--ssh", default="ssh", help="ssh binary (default: ssh)")
     sub = parser.add_subparsers(dest="check", metavar="CHECK")
     sub.required = True
     for name, (_, _, help_text, warning, critical) in CHECKS.items():
         p = sub.add_parser(name, help=help_text, description=help_text)
-        rtype = parse_triplet if name == "load" else Range
+        rtype = {"load": parse_triplet, "inet": parse_ping_thresholds}.get(name, Range)
         if warning or critical or name in ("uptime",):
+            # argparse formats help texts with %, so % must be doubled
+            kind = "ping thresholds RTA,LOSS%%" if name == "inet" else "threshold range"
+            shown_w = (warning or "none").replace("%", "%%")
+            shown_c = (critical or "none").replace("%", "%%")
             p.add_argument("-w", "--warning", type=rtype, default=rtype(warning),
-                           help=f"warning threshold range (default: {warning or 'none'})")
+                           help=f"warning {kind} (default: {shown_w})")
             p.add_argument("-c", "--critical", type=rtype, default=rtype(critical),
-                           help=f"critical threshold range (default: {critical or 'none'})")
+                           help=f"critical {kind} (default: {shown_c})")
         if name == "load":
             p.add_argument("-r", "--percpu", action="store_true",
                            help="divide the load averages by the number of CPUs")
@@ -658,13 +797,34 @@ def build_parser() -> argparse.ArgumentParser:
         elif name == "updates":
             p.add_argument("-n", "--no-refresh", action="store_true",
                            help="do not refresh the package lists before checking")
+        elif name == "inet":
+            p.add_argument("-D", "--dns-name", default="openwrt.org",
+                           help="name to look up (default: openwrt.org)")
+            p.add_argument("-S", "--dns-server",
+                           help="DNS server to ask (default: the device's resolver)")
+            p.add_argument("-A", "--address", default="9.9.9.9",
+                           help="address to ping (default: 9.9.9.9)")
+            p.add_argument("--packets", type=int, default=3,
+                           help="number of ping packets (default: 3)")
+            p.add_argument("-U", "--url", default="https://downloads.openwrt.org/",
+                           help="URL to fetch (default: https://downloads.openwrt.org/)")
+            p.add_argument("--http-timeout", type=int, default=10,
+                           help="timeout of the HTTP(S) request in seconds (default: 10)")
+            p.add_argument("--no-dns", action="store_true", help="skip the DNS test")
+            p.add_argument("--no-ping", action="store_true", help="skip the ping test")
+            p.add_argument("--no-http", action="store_true", help="skip the HTTP(S) test")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.timeout is None:
-        args.timeout = 60 if args.check == "updates" else 10
+        if args.check == "updates":
+            args.timeout = 60
+        elif args.check == "inet":
+            args.timeout = inet_timeout(args)
+        else:
+            args.timeout = 10
     script, check = CHECKS[args.check][:2]
     try:
         result = check(run_ssh(args, script(args)), args)

@@ -302,6 +302,156 @@ class UpdatesTest(unittest.TestCase):
         self.assertEqual(ssh.call_args[0][0].timeout, 60)
 
 
+DNS_OK = """@@dns@@
+Server:\t\t127.0.0.1
+Address:\t127.0.0.1:53
+
+Non-authoritative answer:
+Name:\texample.org
+Address: 192.0.2.80
+
+Non-authoritative answer:
+Name:\texample.org
+Address: 2001:db8::80
+
+@@dns-rc 0 1000.00 1000.03@@
+"""
+DNS_NXDOMAIN = """@@dns@@
+Server:\t\t127.0.0.1
+Address:\t127.0.0.1:53
+
+** server can't find example.invalid: NXDOMAIN
+
+** server can't find example.invalid: NXDOMAIN
+
+@@dns-rc 1 1000.00 1000.01@@
+"""
+DNS_TIMEOUT = """@@dns@@
+;; connection timed out; no servers could be reached
+@@dns-rc 1 1000.00 1010.00@@
+"""
+
+
+def ping(received, rtt="14.914/16.210/16.924"):
+    out = (f"@@ping@@\nPING 198.51.100.9 (198.51.100.9): 56 data bytes\n\n"
+           f"--- 198.51.100.9 ping statistics ---\n"
+           f"3 packets transmitted, {received} packets received, "
+           f"{100 - received * 100 // 3}% packet loss\n")
+    if received:
+        out += f"round-trip min/avg/max = {rtt} ms\n"
+    return out + f"@@ping-rc {0 if received else 1}@@\n"
+
+
+HTTP_OK = """@@http@@
+Downloading 'https://example.org/'
+Connecting to 192.0.2.80:443
+Writing to '/dev/null'
+Download completed (9186 bytes)
+@@http-rc 0 1000.10 1000.58@@
+"""
+HTTP_BAD_CERT = """@@http@@
+Downloading 'https://example.org/'
+Connecting to 192.0.2.80:443
+SSL verify error: certificate has expired
+Connection error: Invalid SSL certificate
+@@http-rc 5 1000.10 1000.30@@
+"""
+
+
+class InetTest(unittest.TestCase):
+    ARGS = ["inet", "-D", "example.org", "-A", "198.51.100.9", "-U", "https://example.org/"]
+
+    def test_all_ok(self):
+        state, text = run(self.ARGS, DNS_OK + ping(3) + HTTP_OK)
+        self.assertEqual(state, co.OK)
+        first = text.splitlines()[0]
+        self.assertIn("internet access: DNS 0.03 s, ping 198.51.100.9 0% loss, rta 16.2 ms, "
+                      "HTTPS 0.48 s", first)
+        self.assertIn("rta=16.21ms;200;500;0", first)
+        self.assertIn("pl=0%;20;60;0;100", first)
+        self.assertIn("http_time=0.48s", first)
+        self.assertIn("example.org: 192.0.2.80, 2001:db8::80", text)
+        lines = text.splitlines()
+        self.assertTrue(lines[1].startswith("[OK] DNS") and lines[2].startswith("[OK] ping")
+                        and lines[3].startswith("[OK] HTTPS"))
+
+    def test_nxdomain(self):
+        state, text = run(self.ARGS, DNS_NXDOMAIN + ping(3) + HTTP_OK)
+        self.assertEqual(state, co.CRITICAL)
+        self.assertIn("DNS lookup of example.org failed: NXDOMAIN", text)
+
+    def test_dns_timeout(self):
+        state, text = run(self.ARGS + ["--no-ping", "--no-http"], DNS_TIMEOUT)
+        self.assertEqual(state, co.CRITICAL)
+        self.assertIn("failed: connection timed out; no servers could be reached", text)
+
+    def test_ping_lost_but_http_works_is_warning(self):
+        state, text = run(self.ARGS, DNS_OK + ping(0) + HTTP_OK)
+        self.assertEqual(state, co.WARNING)
+        self.assertIn("100% loss (HTTP works)", text)
+
+    def test_ping_lost_without_http_is_critical(self):
+        state, _ = run(self.ARGS + ["--no-http"], DNS_OK + ping(0))
+        self.assertEqual(state, co.CRITICAL)
+
+    def test_ping_lost_and_http_failed(self):
+        state, text = run(self.ARGS, DNS_OK + ping(0) + HTTP_BAD_CERT)
+        self.assertEqual(state, co.CRITICAL)
+        self.assertNotIn("HTTP works", text)
+        self.assertIn("HTTPS failed: SSL verify error: certificate has expired; "
+                      "Connection error: Invalid SSL certificate", text)
+
+    def test_rta_thresholds(self):
+        out = DNS_OK + ping(3, "250.0/300.0/350.0") + HTTP_OK
+        self.assertEqual(run(self.ARGS, out)[0], co.WARNING)
+        self.assertEqual(run(self.ARGS + ["-c", "280,60%"], out)[0], co.WARNING)
+        self.assertEqual(run(self.ARGS + ["-c", "280,60%", "--no-http"], out)[0], co.CRITICAL)
+
+    def test_loss_thresholds(self):
+        state, text = run(self.ARGS, DNS_OK + ping(2) + HTTP_OK)
+        self.assertEqual(state, co.WARNING)
+        self.assertIn("33% loss", text)
+
+    def test_bad_ping_address(self):
+        out = "@@ping@@\nping: bad address 'example.invalid'\n@@ping-rc 1@@\n"
+        state, text = run(["inet", "--no-dns", "--no-http"], out)
+        self.assertEqual(state, co.CRITICAL)
+        self.assertIn("bad address", text)
+
+    def test_missing_result_is_unknown(self):
+        state, text = run(self.ARGS, DNS_OK + ping(3))
+        self.assertEqual(state, co.UNKNOWN)
+        self.assertIn("no result of the http test", text)
+
+    def test_all_disabled(self):
+        state, text = run(["inet", "--no-dns", "--no-ping", "--no-http"], "")
+        self.assertEqual(state, co.UNKNOWN)
+        self.assertIn("all tests are disabled", text)
+
+    def test_threshold_format(self):
+        args = parse("inet", "-w", "100,10%")
+        self.assertEqual([str(r) for r in args.warning], ["100", "10"])
+        with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
+            parse("inet", "-w", "100")
+
+    def test_script_quotes_values(self):
+        args = parse("inet", "-D", "a b", "-S", "192.0.2.53", "-A", "x;y", "--packets", "5",
+                     "-U", "https://example.org/?a=1&b=2", "--http-timeout", "7")
+        script = co.script_inet(args)
+        self.assertIn("nslookup -timeout=5 -retry=1 'a b' '192.0.2.53'", script)
+        self.assertIn("ping -q -c 5 -W 1 -w 7 'x;y'", script)
+        self.assertIn("uclient-fetch -T 7 -O /dev/null 'https://example.org/?a=1&b=2'", script)
+        self.assertNotIn("nslookup", co.script_inet(parse("inet", "--no-dns")))
+
+    def test_timeout_default(self):
+        self.assertEqual(co.inet_timeout(parse("inet")), 5 + 10 + 5 + 10)
+        self.assertEqual(co.inet_timeout(parse("inet", "--no-dns", "--no-ping")), 15)
+        with mock.patch.object(co, "run_ssh", return_value="") as ssh, \
+                mock.patch("builtins.print"):
+            co.main(["-H", "device.example", "inet"])
+        self.assertEqual(ssh.call_args[0][0].timeout, 30)
+
+
 class SshTest(unittest.TestCase):
     def test_command_line(self):
         args = parse("-l", "monitor", "-p", "2222", "-i", "/key", "-o", "Foo=bar", "uptime")

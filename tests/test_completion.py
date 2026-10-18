@@ -86,7 +86,8 @@ class CompletionTests(unittest.TestCase):
 
     def test_no_values_for_thresholds_and_names(self):
         for words in (("-p", ""), ("-t", ""), ("mem", "-w", ""), ("iface", "-x", ""),
-                      ("services", "--service", "=", "")):
+                      ("services", "--service", "=", ""), ("inet", "-U", ""),
+                      ("inet", "--dns-name", "=", "")):
             self.assertEqual(complete(*words), [], words)
 
     def test_unknown_check(self):
