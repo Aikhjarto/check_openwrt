@@ -17,7 +17,7 @@ import re
 import subprocess
 import sys
 
-__version__ = "0.1"
+__version__ = "0.2"
 
 OK, WARNING, CRITICAL, UNKNOWN = 0, 1, 2, 3
 STATE_NAMES = {OK: "OK", WARNING: "WARNING", CRITICAL: "CRITICAL", UNKNOWN: "UNKNOWN"}

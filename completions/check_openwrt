@@ -1,0 +1,104 @@
+# bash completion for check_openwrt                          -*- shell-script -*-
+
+_check_openwrt()
+{
+    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
+    # --option=value: bash splits at the =
+    if [[ $cur == = ]]; then
+        cur=
+    elif [[ $prev == = && $COMP_CWORD -ge 2 ]]; then
+        prev=${COMP_WORDS[COMP_CWORD-2]}
+    fi
+    COMPREPLY=()
+
+    # the check is the first word that is neither an option nor the value of
+    # one of the options before it
+    local i check=
+    for ((i = 1; i < COMP_CWORD; i++)); do
+        case ${COMP_WORDS[i]} in
+            -H | --hostname | -l | --user | -p | --port | -i | --identity | \
+                -o | --ssh-option | -t | --timeout | --ssh)
+                # skip the value; bash splits --option=VALUE at the =
+                [[ ${COMP_WORDS[i+1]} == = ]] && ((i++))
+                ((i++))
+                ;;
+            -*)
+                ;;
+            *)
+                check=${COMP_WORDS[i]}
+                break
+                ;;
+        esac
+    done
+
+    if [[ -z $check ]]; then
+        case $prev in
+            -H | --hostname)
+                mapfile -t COMPREPLY < <(compgen -A hostname -- "$cur")
+                return
+                ;;
+            -l | --user)
+                mapfile -t COMPREPLY < <(compgen -u -- "$cur")
+                return
+                ;;
+            -i | --identity)
+                compopt -o filenames 2>/dev/null
+                mapfile -t COMPREPLY < <(compgen -f -- "$cur")
+                return
+                ;;
+            --ssh)
+                compopt -o filenames 2>/dev/null
+                mapfile -t COMPREPLY < <(compgen -c -- "$cur")
+                return
+                ;;
+            -p | --port | -o | --ssh-option | -t | --timeout)
+                return
+                ;;
+        esac
+        mapfile -t COMPREPLY < <(compgen -W '-h --help -V --version -H --hostname
+            -l --user -p --port -i --identity -o --ssh-option -t --timeout --ssh
+            mem disk load uptime conntrack iface wifi wireguard services updates' -- "$cur")
+        return
+    fi
+
+    # options of the check; their values (thresholds, names on the device)
+    # cannot be completed
+    case $prev in
+        -w | --warning | -c | --critical | -P | --path | --peer | -I | --interface | \
+            -x | --exclude | -R | --radio | -s | --service)
+            return
+            ;;
+    esac
+    local options='-h --help'
+    case $check in
+        mem | uptime | conntrack)
+            options+=' -w --warning -c --critical'
+            ;;
+        disk)
+            options+=' -w --warning -c --critical -P --path'
+            ;;
+        load)
+            options+=' -w --warning -c --critical -r --percpu'
+            ;;
+        iface)
+            options+=' -I --interface -x --exclude'
+            ;;
+        wifi)
+            options+=' -R --radio -x --exclude'
+            ;;
+        wireguard)
+            options+=' -w --warning -c --critical -I --interface -P --peer -a --all-peers'
+            ;;
+        services)
+            options+=' -s --service -x --exclude'
+            ;;
+        updates)
+            options+=' -w --warning -c --critical -n --no-refresh'
+            ;;
+        *)
+            return
+            ;;
+    esac
+    mapfile -t COMPREPLY < <(compgen -W "$options" -- "$cur")
+}
+complete -F _check_openwrt check_openwrt check_openwrt.py

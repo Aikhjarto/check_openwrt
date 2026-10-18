@@ -58,6 +58,16 @@ Alternatively install it with pip, which creates a `check_openwrt` command:
 pip install .
 ```
 
+## Bash completion
+
+`completions/check_openwrt` completes the checks, the options of the plugin
+and of each check, host names, users and the key file. The packages install
+it; otherwise copy it to bash-completion's directory:
+
+```sh
+install -D -m 0644 completions/check_openwrt /usr/share/bash-completion/completions/check_openwrt
+```
+
 ## SSH setup
 
 1. Create a key for the monitoring user (if it has none) and add the public
