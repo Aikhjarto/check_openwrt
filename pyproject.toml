@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "check_openwrt"
+dynamic = ["version"]
+description = "Agentless Nagios/Naemon/Icinga plugin for OpenWrt devices via SSH"
+readme = "README.md"
+license = { text = "GPL-2.0-or-later" }
+authors = [{ name = "Thomas Wagner", email = "wagner-thomas@gmx.at" }]
+requires-python = ">=3.7"
+dependencies = []
+keywords = ["openwrt", "nagios", "naemon", "icinga", "monitoring", "plugin"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: GNU General Public License v2 or later (GPLv2+)",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Monitoring",
+    "Topic :: System :: Networking :: Monitoring",
+]
+
+[project.urls]
+Homepage = "https://github.com/Aikhjarto/check_openwrt"
+Issues = "https://github.com/Aikhjarto/check_openwrt/issues"
+
+[project.scripts]
+check_openwrt = "check_openwrt:main"
+
+[tool.setuptools]
+py-modules = ["check_openwrt"]
+
+[tool.setuptools.dynamic]
+version = { attr = "check_openwrt.__version__" }
