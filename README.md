@@ -160,7 +160,8 @@ OPENWRT WIFI OK - 2 radios up, 0 disabled, 6 clients | clients_phy0-ap0=4;;;0 cl
   this check rarely, e.g. once a day. Note that upgrading individual packages
   is usually not recommended on OpenWrt; many available updates often mean a
   new point release is available for sysupgrade.
-* **banip**: reads banIP's runtime file (`/var/run/banip_runtime.json`) and
+* **banip**: reads banIP's runtime file (`/var/run/banIP/banIP.runtime.json`,
+  or `/var/run/banip_runtime.json` in older versions such as 1.5) and
   its nftables sets (`nft -j`). CRITICAL if banIP is not active or, by
   default, if the block lists hold no entries at all, e.g. because the feed
   option is missing after an upgrade from banIP 0.x (`ban_sources` was

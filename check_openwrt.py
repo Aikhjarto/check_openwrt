@@ -18,7 +18,7 @@ import re
 import subprocess
 import sys
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 OK, WARNING, CRITICAL, UNKNOWN = 0, 1, 2, 3
 STATE_NAMES = {OK: "OK", WARNING: "WARNING", CRITICAL: "CRITICAL", UNKNOWN: "UNKNOWN"}
@@ -728,7 +728,9 @@ def check_inet(out: str, args) -> Result:
 
 
 def script_banip(args) -> str:
-    return ("cat /var/run/banip_runtime.json 2>/dev/null || echo '{}'\n"
+    # newer banIP (1.9 in OpenWrt 25.12) keeps it in /var/run/banIP/, 1.5 in /var/run/
+    return ("cat /var/run/banIP/banIP.runtime.json 2>/dev/null"
+            " || cat /var/run/banip_runtime.json 2>/dev/null || echo '{}'\n"
             "echo @@now@@\n"
             "date '+%Y-%m-%d %H:%M:%S'\n"
             "echo @@sets@@\n"
@@ -741,7 +743,7 @@ def check_banip(out: str, args) -> Result:
     parts = sections(out)
     runtime = load_json(parts.get("", "").strip() or "{}", "banIP runtime file")
     if not runtime:
-        raise CheckError("banIP is not installed or has not run (no /var/run/banip_runtime.json)")
+        raise CheckError("banIP is not installed or has not run (no runtime file)")
     sets = load_json(parts.get("sets", "").strip() or '{"nftables": []}', "nft set list")
     counts = {}
     for item in sets.get("nftables", []):
