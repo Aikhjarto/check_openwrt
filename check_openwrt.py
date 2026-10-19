@@ -18,7 +18,7 @@ import re
 import subprocess
 import sys
 
-__version__ = "0.5"
+__version__ = "0.5.1"
 
 OK, WARNING, CRITICAL, UNKNOWN = 0, 1, 2, 3
 STATE_NAMES = {OK: "OK", WARNING: "WARNING", CRITICAL: "CRITICAL", UNKNOWN: "UNKNOWN"}
@@ -844,7 +844,9 @@ def check_temp(out: str, args) -> Result:
             name, label = sensor_name("hwmon", fields[1])
             if fields[2] != "temp1" or fields[3]:
                 extra = fields[3] or fields[2]
-                name, label = f"{name} {extra}", f"{label}_{re.sub(r'[^\w.-]', '_', extra)}"
+                # no backslash in the f-string expression, a SyntaxError before Python 3.12
+                suffix = re.sub(r"[^\w.-]", "_", extra)
+                name, label = f"{name} {extra}", f"{label}_{suffix}"
             raw, crit = fields[4], fields[5]
         else:
             continue
