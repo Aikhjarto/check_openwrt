@@ -18,7 +18,7 @@ standard library.
 | Check       | What it monitors                                                    | Default thresholds |
 |-------------|---------------------------------------------------------------------|--------------------|
 | `mem`       | memory usage in percent, based on `MemAvailable`                    | `-w 80 -c 90`      |
-| `disk`      | usage of `/overlay` (or `/`) in percent, other mount points with `-P` | `-w 80 -c 90`    |
+| `disk`      | usage of `/overlay` (or `/`) in percent, other mount points with `-P`; CRITICAL if not mounted or read-only | `-w 80 -c 90` |
 | `load`      | load averages (1, 5, 15 min), per CPU with `-r`                     | `-w 4,3,2 -c 8,6,4` |
 | `uptime`    | uptime in seconds, detects (unnoticed) reboots                      | `-w 3600:`         |
 | `conntrack` | usage of the connection tracking table in percent                   | `-w 75 -c 90`      |
@@ -28,6 +28,7 @@ standard library.
 | `services`  | procd service instances are running                                 | dead daemon: CRITICAL, failed one-shot job: WARNING |
 | `updates`   | number of upgradable packages (`opkg` or `apk`)                     | `-w 0`             |
 | `banip`     | banIP is active, number of block list entries, age of the last run  | `-c 1:` (CRITICAL with no entries), `-a 90000` |
+| `temp`      | temperatures of all thermal zones and hwmon sensors (CPU, Wi-Fi and Ethernet chips) in °C | `-w 80 -c 95` |
 | `inet`      | internet access from the device: DNS lookup, ping and HTTP(S) fetch | `-w 200,20% -c 500,60%` (ping) |
 
 Thresholds use the standard
@@ -118,6 +119,7 @@ check_openwrt -H router.example.org services -s dnsmasq -s dropbear
 check_openwrt -H router.example.org updates
 check_openwrt -H router.example.org inet
 check_openwrt -H router.example.org banip -w 1000:
+check_openwrt -H router.example.org temp -w 75 -c 90
 check_openwrt -H router.example.org inet -A 2001:db8::1 -U https://example.org/ --no-dns
 ```
 
@@ -133,6 +135,12 @@ OPENWRT WIFI OK - 2 radios up, 0 disabled, 6 clients | clients_phy0-ap0=4;;;0 cl
 
 ### Notes on individual checks
 
+* **disk**: without `-P` the overlay (or `/`) is checked. Paths given with
+  `-P` must be mount points: a path that does not exist, or that is only a
+  directory on another file system (e.g. a USB stick that is not mounted, so
+  `df` would measure the root file system instead), is CRITICAL. A file
+  system mounted read-only (a full or failing flash or USB stick) is
+  CRITICAL as well. Example for a USB stick: `disk -P /mnt/sda1`.
 * **iface**: without `-I`, all interfaces with `autostart` enabled are
   checked. Exclude interfaces that are expected to be down, e.g. `wan6` when
   the provider has no IPv6.
@@ -161,6 +169,14 @@ OPENWRT WIFI OK - 2 radios up, 0 disabled, 6 clients | clients_phy0-ap0=4;;;0 cl
   schedule `/etc/init.d/banip reload` in cron). `-w`/`-c` are ranges for the
   number of block entries, allowlist entries are not counted. Performance
   data: entries per set and blocked packets per set. Tested with banIP 1.5.
+* **temp**: reads `/sys/class/thermal` and `/sys/class/hwmon`; a hwmon
+  sensor that only mirrors a thermal zone is counted once. Sensors are named
+  `cpu`, `wifi phy0 (mt7915)`, `ethernet phy 05` and so on; the performance
+  data label (`cpu`, `wifi_phy0`, `eth_phy_05`) is also the name for `-x`.
+  The device's own critical limit is shown when the kernel reports one.
+  Sensors that cannot be read are listed but ignored, e.g. ath10k Wi-Fi chips
+  with their radios disabled; with no readable sensor at all the check is
+  UNKNOWN.
 * **inet**: runs three tests on the device, so it checks the device's own
   internet access, independent of the monitoring server's connection:
   * DNS: looks up `-D` (default `openwrt.org`) with `nslookup` through the

@@ -18,7 +18,7 @@ import re
 import subprocess
 import sys
 
-__version__ = "0.4"
+__version__ = "0.5"
 
 OK, WARNING, CRITICAL, UNKNOWN = 0, 1, 2, 3
 STATE_NAMES = {OK: "OK", WARNING: "WARNING", CRITICAL: "CRITICAL", UNKNOWN: "UNKNOWN"}
@@ -205,31 +205,68 @@ def check_mem(out: str, args) -> Result:
 
 
 def script_disk(args) -> str:
+    # one section per path: "@@df N@@" + df output (or nothing if it fails)
     if args.path:
-        return "df -kP " + " ".join(shell_quote(p) for p in args.path)
-    return "df -kP /overlay 2>/dev/null || df -kP /"
+        df = "\n".join(f"echo @@df {i}@@; df -kP {shell_quote(p)} 2>/dev/null | tail -n +2"
+                       for i, p in enumerate(args.path))
+    else:
+        df = "echo @@df 0@@; { df -kP /overlay 2>/dev/null || df -kP /; } | tail -n +2"
+    return df + "\necho @@mounts@@\ncat /proc/mounts"
+
+
+def mount_options(mounts: str) -> dict[str, list[str]]:
+    """Mount options per mount point from /proc/mounts (last entry wins)."""
+    options = {}
+    for line in mounts.splitlines():
+        fields = line.split()
+        if len(fields) >= 4:
+            point = fields[1].replace("\\040", " ")
+            options[point] = fields[3].split(",")
+    return options
 
 
 def check_disk(out: str, args) -> Result:
+    parts = sections(out)
+    options = mount_options(parts.get("mounts", ""))
     res = Result()
     texts = []
-    rows = [line.split() for line in out.splitlines()[1:] if line.strip()]
-    if not rows:
-        raise CheckError("no filesystems found")
-    for row in rows:
+    problems = []
+    paths = args.path or [None]
+    for index, wanted in enumerate(paths):
+        lines = [line for line in parts.get(f"df {index}", "").splitlines() if line.strip()]
+        if not lines:
+            if wanted is None:
+                raise CheckError("no filesystems found")
+            res.set(CRITICAL)
+            text = f"{wanted} does not exist"
+            problems.append(text)
+            res.details.append(f"[CRITICAL] {text}")
+            continue
+        row = lines[0].split()
         if len(row) < 6 or not row[1].isdigit():
             raise CheckError(f"could not parse df output: {' '.join(row)}")
         used, avail, mount = int(row[2]) * 1024, int(row[3]) * 1024, " ".join(row[5:])
+        if wanted and wanted.rstrip("/") != mount.rstrip("/") and wanted != mount:
+            res.set(CRITICAL)
+            text = f"{wanted} is not mounted (it is part of {mount})"
+            problems.append(text)
+            res.details.append(f"[CRITICAL] {text}")
+            continue
         size = used + avail
         pct = 100.0 * used / size if size else 0.0
         state = evaluate(pct, args.warning, args.critical)
-        res.set(state)
         text = f"{mount} {pct:.1f}% used ({fmt_bytes(avail)} free)"
+        if "ro" in options.get(mount, []):
+            state = CRITICAL
+            text += ", mounted read-only"
+        res.set(state)
         texts.append(text)
+        if state != OK:
+            problems.append(text)
         res.details.append(f"[{STATE_NAMES[state]}] {text}, size {fmt_bytes(size)}")
         res.perf(f"{mount}_pct", round(pct, 2), "%", args.warning, args.critical, 0, 100)
         res.perf(mount, used, "B", "", "", 0, size)
-    res.summary = ", ".join(texts)
+    res.summary = ", ".join(problems) if problems else ", ".join(texts)
     return res
 
 
@@ -755,6 +792,92 @@ def check_banip(out: str, args) -> Result:
     return res
 
 
+def script_temp(args) -> str:
+    # one line per sensor: zone|type|millidegrees|critical trip, or
+    # hwmon|name|sensor|label|millidegrees|critical; ERR = not readable
+    return (r"""for z in /sys/class/thermal/thermal_zone*; do
+  [ -e "$z/temp" ] || continue
+  crit=
+  for t in "$z"/trip_point_*_type; do
+    [ -e "$t" ] && [ "$(cat "$t")" = critical ] && crit=$(cat "${t%_type}_temp")
+  done
+  v=$(cat "$z/temp" 2>/dev/null) || v=ERR
+  echo "zone|$(cat "$z/type")|${v:-ERR}|$crit"
+done
+for h in /sys/class/hwmon/hwmon*; do
+  case "$(readlink -f "$h/device" 2>/dev/null)" in *thermal_zone*) continue;; esac
+  for t in "$h"/temp*_input; do
+    [ -e "$t" ] || continue
+    b=${t%_input}
+    v=$(cat "$t" 2>/dev/null) || v=ERR
+    echo "hwmon|$(cat "$h/name" 2>/dev/null)|${b##*/}|$(cat "${b}_label" 2>/dev/null)|${v:-ERR}|$(cat "${b}_crit" 2>/dev/null)"
+  done
+done""")
+
+
+def sensor_name(kind: str, name: str) -> tuple[str, str]:
+    """Readable name and performance data label of a temperature sensor."""
+    if kind == "zone":
+        base = name[:-len("-thermal")] if name.endswith("-thermal") else name
+        return base, base
+    match = re.fullmatch(r"(\w+?)_(phy\d+)", name)
+    if match:
+        return f"wifi {match.group(2)} ({match.group(1)})", f"wifi_{match.group(2)}"
+    match = re.fullmatch(r"(\w+?)_hwmon", name)
+    if match:
+        return f"wifi ({match.group(1)})", f"wifi_{match.group(1)}"
+    match = re.fullmatch(r"mdio[-_]bus:(\w+)", name)
+    if match:
+        return f"ethernet phy {match.group(1)}", f"eth_phy_{match.group(1)}"
+    return name, re.sub(r"[^\w.-]", "_", name)
+
+
+def check_temp(out: str, args) -> Result:
+    sensors = []
+    skipped = []
+    for line in out.splitlines():
+        fields = line.split("|")
+        if fields[0] == "zone" and len(fields) == 4:
+            name, label = sensor_name("zone", fields[1])
+            raw, crit = fields[2], fields[3]
+        elif fields[0] == "hwmon" and len(fields) == 6:
+            name, label = sensor_name("hwmon", fields[1])
+            if fields[2] != "temp1" or fields[3]:
+                extra = fields[3] or fields[2]
+                name, label = f"{name} {extra}", f"{label}_{re.sub(r'[^\w.-]', '_', extra)}"
+            raw, crit = fields[4], fields[5]
+        else:
+            continue
+        if args.exclude and label in args.exclude:
+            continue
+        if not raw.lstrip("-").isdigit():
+            skipped.append(name)
+            continue
+        sensors.append((name, label, int(raw) / 1000,
+                        int(crit) / 1000 if crit.lstrip("-").isdigit() else None))
+    if not sensors:
+        raise CheckError("no readable temperature sensors"
+                         + (f" ({', '.join(skipped)} not readable)" if skipped else ""))
+    res = Result()
+    problems = []
+    for name, label, value, crit in sensors:
+        state = evaluate(value, args.warning, args.critical)
+        res.set(state)
+        text = f"{name} {value:.1f} °C"
+        if state != OK:
+            problems.append(text)
+        limit = f" (device limit {crit:.0f} °C)" if crit else ""
+        res.details.append(f"[{STATE_NAMES[state]}] {text}{limit}")
+        res.perf(label, round(value, 1), "", args.warning, args.critical)
+    for name in skipped:
+        res.details.append(f"[info] {name} not readable")
+    hottest = max(sensors, key=lambda s: s[2])
+    res.summary = (", ".join(problems) if problems else
+                   f"hottest {hottest[0]} {hottest[2]:.1f} °C ({len(sensors)} "
+                   f"{'sensor' if len(sensors) == 1 else 'sensors'})")
+    return res
+
+
 CHECKS = {
     "mem": (script_mem, check_mem, "memory usage in percent", "80", "90"),
     "disk": (script_disk, check_disk, "disk usage in percent (default /overlay)", "80", "90"),
@@ -772,6 +895,8 @@ CHECKS = {
              "200,20%", "500,60%"),
     "banip": (script_banip, check_banip, "banIP status, number of block list entries and last run",
               "", "1:"),
+    "temp": (script_temp, check_temp, "temperatures of CPU, Wi-Fi and Ethernet chips in degrees Celsius",
+             "80", "95"),
 }
 
 
@@ -841,7 +966,8 @@ def build_parser() -> argparse.ArgumentParser:
                            help="divide the load averages by the number of CPUs")
         elif name == "disk":
             p.add_argument("-P", "--path", action="append",
-                           help="mount point to check, can be given multiple times")
+                           help="mount point to check, can be given multiple times; "
+                                "CRITICAL if it is not mounted")
         elif name == "iface":
             p.add_argument("-I", "--interface", action="append",
                            help="interface to check (default: all with autostart)")
@@ -865,6 +991,9 @@ def build_parser() -> argparse.ArgumentParser:
         elif name == "updates":
             p.add_argument("-n", "--no-refresh", action="store_true",
                            help="do not refresh the package lists before checking")
+        elif name == "temp":
+            p.add_argument("-x", "--exclude", action="append",
+                           help="sensor to skip, by its performance data label (e.g. eth_phy_05)")
         elif name == "banip":
             p.add_argument("-a", "--max-age", type=int, default=90000,
                            help="WARNING if the last banIP run is older, in seconds "

@@ -83,16 +83,44 @@ class SimpleChecksTest(unittest.TestCase):
                        MEMINFO.replace("MemAvailable", "Ignored"))
         self.assertEqual(state, co.OK)
 
+    MOUNTS = ("/dev/root /rom squashfs ro,relatime 0 0\n"
+              "/dev/ubi0_1 /overlay ubifs rw,noatime 0 0\n"
+              "overlayfs:/overlay / overlay rw,noatime 0 0\n"
+              "/dev/sda1 /mnt/usb f2fs rw,lazytime 0 0\n")
+
     def test_disk(self):
-        df = ("Filesystem           1024-blocks    Used Available Capacity Mounted on\n"
-              "/dev/ubi0_1              10000      9500       500  95% /overlay\n")
-        state, text = run(["disk"], df)
+        out = ("@@df 0@@\n/dev/ubi0_1 10000 9500 500 95% /overlay\n@@mounts@@\n" + self.MOUNTS)
+        state, text = run(["disk"], out)
         self.assertEqual(state, co.CRITICAL)
         self.assertIn("/overlay 95.0% used", text)
 
+    def test_disk_paths(self):
+        out = ("@@df 0@@\n/dev/sda1 4000 400 3600 10% /mnt/usb\n"
+               "@@df 1@@\noverlayfs:/overlay 10000 1000 9000 10% /\n"
+               "@@df 2@@\n@@mounts@@\n" + self.MOUNTS)
+        state, text = run(["disk", "-P", "/mnt/usb", "-P", "/mnt/old", "-P", "/mnt/gone"], out)
+        self.assertEqual(state, co.CRITICAL)
+        first = text.splitlines()[0]
+        self.assertIn("/mnt/old is not mounted (it is part of /), /mnt/gone does not exist", first)
+        self.assertIn("/mnt/usb_pct=10%", first)
+        self.assertIn("[OK] /mnt/usb 10.0% used", text)
+
+    def test_disk_read_only(self):
+        mounts = self.MOUNTS.replace("f2fs rw,", "f2fs ro,")
+        out = "@@df 0@@\n/dev/sda1 4000 400 3600 10% /mnt/usb\n@@mounts@@\n" + mounts
+        state, text = run(["disk", "-P", "/mnt/usb"], out)
+        self.assertEqual(state, co.CRITICAL)
+        self.assertIn("/mnt/usb 10.0% used (3.5 MiB free), mounted read-only", text)
+
+    def test_disk_trailing_slash(self):
+        out = "@@df 0@@\n/dev/sda1 4000 400 3600 10% /mnt/usb\n@@mounts@@\n" + self.MOUNTS
+        self.assertEqual(run(["disk", "-P", "/mnt/usb/"], out)[0], co.OK)
+
     def test_disk_script_quotes_paths(self):
-        self.assertEqual(co.script_disk(parse("disk", "-P", "/mnt/my disk", "-P", "/tmp")),
-                         "df -kP '/mnt/my disk' '/tmp'")
+        script = co.script_disk(parse("disk", "-P", "/mnt/my disk", "-P", "/tmp"))
+        self.assertIn("echo @@df 0@@; df -kP '/mnt/my disk' 2>/dev/null", script)
+        self.assertIn("echo @@df 1@@; df -kP '/tmp' 2>/dev/null", script)
+        self.assertIn("cat /proc/mounts", script)
 
     def test_load_percpu(self):
         state, text = run(["load", "-r", "-w", "1", "-c", "2"],
@@ -506,6 +534,47 @@ class BanipTest(unittest.TestCase):
         state, text = run(["banip"], "{}\n@@now@@\n2026-10-19 10:00:00\n@@sets@@\n@@rules@@\n")
         self.assertEqual(state, co.UNKNOWN)
         self.assertIn("not installed", text)
+
+
+TEMPS = "\n".join([
+    "zone|cpu-thermal|52096|125000",
+    "hwmon|mdio_bus:05|temp1||54721|",
+    "hwmon|mt7915_phy0|temp1||55000|110000",
+    "hwmon|ath10k_hwmon|temp1||ERR|",
+    "hwmon|nct6775|temp2|SYSTIN|41000|",
+])
+
+
+class TempTest(unittest.TestCase):
+    def test_ok(self):
+        state, text = run(["temp"], TEMPS)
+        self.assertEqual(state, co.OK)
+        self.assertIn("hottest wifi phy0 (mt7915) 55.0 °C (4 sensors)", text)
+        self.assertIn("cpu=52.1;80;95", text)
+        self.assertIn("eth_phy_05=54.7;80;95", text)
+        self.assertIn("nct6775_SYSTIN=41;80;95", text)
+        self.assertIn("[OK] wifi phy0 (mt7915) 55.0 °C (device limit 110 °C)", text)
+        self.assertIn("[info] wifi (ath10k) not readable", text)
+
+    def test_thresholds(self):
+        state, text = run(["temp", "-w", "53", "-c", "54.9"], TEMPS)
+        self.assertEqual(state, co.CRITICAL)
+        self.assertIn("ethernet phy 05 54.7 °C, wifi phy0 (mt7915) 55.0 °C", text)
+
+    def test_exclude(self):
+        state, _ = run(["temp", "-w", "53", "-c", "55", "-x", "eth_phy_05", "-x", "wifi_phy0"],
+                       TEMPS)
+        self.assertEqual(state, co.OK)
+
+    def test_single_sensor(self):
+        state, text = run(["temp"], "hwmon|ath10k_hwmon|temp1||51000|")
+        self.assertEqual(state, co.OK)
+        self.assertIn("hottest wifi (ath10k) 51.0 °C (1 sensor)", text)
+
+    def test_nothing_readable(self):
+        state, text = run(["temp"], "hwmon|ath10k_hwmon|temp1||ERR|")
+        self.assertEqual(state, co.UNKNOWN)
+        self.assertIn("no readable temperature sensors (wifi (ath10k) not readable)", text)
 
 
 class SshTest(unittest.TestCase):
