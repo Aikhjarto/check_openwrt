@@ -57,7 +57,7 @@ _check_openwrt()
         esac
         mapfile -t COMPREPLY < <(compgen -W '-h --help -V --version -H --hostname
             -l --user -p --port -i --identity -o --ssh-option -t --timeout --ssh
-            mem disk load uptime conntrack iface wifi wireguard services updates inet' -- "$cur")
+            mem disk load uptime conntrack iface wifi wireguard services updates inet banip' -- "$cur")
         return
     fi
 
@@ -66,7 +66,8 @@ _check_openwrt()
     case $prev in
         -w | --warning | -c | --critical | -P | --path | --peer | -I | --interface | \
             -x | --exclude | -R | --radio | -s | --service | -D | --dns-name | \
-            -S | --dns-server | -A | --address | --packets | -U | --url | --http-timeout)
+            -S | --dns-server | -A | --address | --packets | -U | --url | --http-timeout | \
+            -a | --max-age)
             return
             ;;
     esac
@@ -95,6 +96,9 @@ _check_openwrt()
             ;;
         updates)
             options+=' -w --warning -c --critical -n --no-refresh'
+            ;;
+        banip)
+            options+=' -w --warning -c --critical -a --max-age'
             ;;
         inet)
             options+=' -w --warning -c --critical -D --dns-name -S --dns-server -A --address

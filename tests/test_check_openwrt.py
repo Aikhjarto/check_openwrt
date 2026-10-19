@@ -452,6 +452,62 @@ class InetTest(unittest.TestCase):
         self.assertEqual(ssh.call_args[0][0].timeout, 30)
 
 
+def banip_output(status="active", last_run="2026-10-19 10:00:00", feed_elems=3,
+                 now="2026-10-19 10:30:00"):
+    runtime = json.dumps({"status": status, "version": "1.5.6-r7",
+                          "last_run": f"mode: restart, {last_run}, duration: 0m 1s"})
+    elems = [{"prefix": {"addr": f"198.51.100.{i}", "len": 32}} for i in range(feed_elems)]
+    sets = json.dumps({"nftables": [
+        {"metainfo": {"version": "1.1.1"}},
+        {"set": {"name": "allowlist.v4", "elem": [{"prefix": {"addr": "192.0.2.0", "len": 24}}]}},
+        {"set": {"name": "blocklist.v4"}},
+        {"set": {"name": "firehol1.v4", "elem": elems}}]})
+    rules = ("table inet banIP {\n chain _inbound {\n"
+             "  ip saddr @allowlist.v4 counter packets 5 bytes 292 accept\n"
+             "  ip saddr @blocklist.v4 counter packets 0 bytes 0 drop\n"
+             "  ip saddr @firehol1.v4 counter packets 13 bytes 600 drop\n }\n}\n"
+             "table inet banIP {\n chain _outbound {\n"
+             "  ip daddr @firehol1.v4 counter packets 2 bytes 100 goto _reject\n }\n}\n")
+    return f"{runtime}\n@@now@@\n{now}\n@@sets@@\n{sets}\n@@rules@@\n{rules}"
+
+
+class BanipTest(unittest.TestCase):
+    def test_ok(self):
+        state, text = run(["banip"], banip_output())
+        self.assertEqual(state, co.OK)
+        self.assertIn("banIP active, 3 block entries in 1 list, last run 30m 0s ago", text)
+        self.assertIn("firehol1.v4: 3 entries, 15 packets blocked", text)
+        self.assertIn("allowlist.v4: 1 entries", text)
+        self.assertIn("block_entries=3;;1:;0", text)
+        self.assertIn("firehol1.v4_blocked=15c", text)
+        self.assertIn("last_run_age=1800s;90000;;0", text)
+
+    def test_empty_lists_are_critical(self):
+        state, _ = run(["banip"], banip_output(feed_elems=0))
+        self.assertEqual(state, co.CRITICAL)
+
+    def test_inactive(self):
+        state, text = run(["banip"], banip_output(status="stopped"))
+        self.assertEqual(state, co.CRITICAL)
+        self.assertIn("banIP stopped", text)
+
+    def test_stale_run(self):
+        state, text = run(["banip"], banip_output(last_run="2026-10-17 10:00:00"))
+        self.assertEqual(state, co.WARNING)
+        self.assertIn("(more than 1d 1h 0m)", text)
+        self.assertEqual(run(["banip", "-a", "0"],
+                             banip_output(last_run="2026-10-17 10:00:00"))[0], co.OK)
+
+    def test_thresholds(self):
+        state, _ = run(["banip", "-w", "1000:"], banip_output())
+        self.assertEqual(state, co.WARNING)
+
+    def test_not_installed(self):
+        state, text = run(["banip"], "{}\n@@now@@\n2026-10-19 10:00:00\n@@sets@@\n@@rules@@\n")
+        self.assertEqual(state, co.UNKNOWN)
+        self.assertIn("not installed", text)
+
+
 class SshTest(unittest.TestCase):
     def test_command_line(self):
         args = parse("-l", "monitor", "-p", "2222", "-i", "/key", "-o", "Foo=bar", "uptime")

@@ -27,6 +27,7 @@ standard library.
 | `wireguard` | handshake age of selected peers (`-P`, `-a`) in seconds, traffic counters | `-w 300 -c 900` |
 | `services`  | procd service instances are running                                 | dead daemon: CRITICAL, failed one-shot job: WARNING |
 | `updates`   | number of upgradable packages (`opkg` or `apk`)                     | `-w 0`             |
+| `banip`     | banIP is active, number of block list entries, age of the last run  | `-c 1:` (CRITICAL with no entries), `-a 90000` |
 | `inet`      | internet access from the device: DNS lookup, ping and HTTP(S) fetch | `-w 200,20% -c 500,60%` (ping) |
 
 Thresholds use the standard
@@ -116,6 +117,7 @@ check_openwrt -H router.example.org wireguard -P "office" -P "xyzKEY...="
 check_openwrt -H router.example.org services -s dnsmasq -s dropbear
 check_openwrt -H router.example.org updates
 check_openwrt -H router.example.org inet
+check_openwrt -H router.example.org banip -w 1000:
 check_openwrt -H router.example.org inet -A 2001:db8::1 -U https://example.org/ --no-dns
 ```
 
@@ -150,6 +152,15 @@ OPENWRT WIFI OK - 2 radios up, 0 disabled, 6 clients | clients_phy0-ap0=4;;;0 cl
   this check rarely, e.g. once a day. Note that upgrading individual packages
   is usually not recommended on OpenWrt; many available updates often mean a
   new point release is available for sysupgrade.
+* **banip**: reads banIP's runtime file (`/var/run/banip_runtime.json`) and
+  its nftables sets (`nft -j`). CRITICAL if banIP is not active or, by
+  default, if the block lists hold no entries at all, e.g. because the feed
+  option is missing after an upgrade from banIP 0.x (`ban_sources` was
+  renamed to `ban_feed`). WARNING if the last run is older than `-a` seconds
+  (default 25 hours; banIP only refreshes its lists when it is reloaded, so
+  schedule `/etc/init.d/banip reload` in cron). `-w`/`-c` are ranges for the
+  number of block entries, allowlist entries are not counted. Performance
+  data: entries per set and blocked packets per set. Tested with banIP 1.5.
 * **inet**: runs three tests on the device, so it checks the device's own
   internet access, independent of the monitoring server's connection:
   * DNS: looks up `-D` (default `openwrt.org`) with `nslookup` through the

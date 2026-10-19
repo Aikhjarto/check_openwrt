@@ -12,12 +12,13 @@ on the device; only tools shipped with a default OpenWrt image are used
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import re
 import subprocess
 import sys
 
-__version__ = "0.3"
+__version__ = "0.4"
 
 OK, WARNING, CRITICAL, UNKNOWN = 0, 1, 2, 3
 STATE_NAMES = {OK: "OK", WARNING: "WARNING", CRITICAL: "CRITICAL", UNKNOWN: "UNKNOWN"}
@@ -689,6 +690,71 @@ def check_inet(out: str, args) -> Result:
     return res
 
 
+def script_banip(args) -> str:
+    return ("cat /var/run/banip_runtime.json 2>/dev/null || echo '{}'\n"
+            "echo @@now@@\n"
+            "date '+%Y-%m-%d %H:%M:%S'\n"
+            "echo @@sets@@\n"
+            "nft -j list sets table inet banIP 2>/dev/null\n"
+            "echo @@rules@@\n"
+            "for c in _inbound _outbound; do nft list chain inet banIP $c 2>/dev/null; done")
+
+
+def check_banip(out: str, args) -> Result:
+    parts = sections(out)
+    runtime = load_json(parts.get("", "").strip() or "{}", "banIP runtime file")
+    if not runtime:
+        raise CheckError("banIP is not installed or has not run (no /var/run/banip_runtime.json)")
+    sets = load_json(parts.get("sets", "").strip() or '{"nftables": []}', "nft set list")
+    counts = {}
+    for item in sets.get("nftables", []):
+        nft_set = item.get("set")
+        if nft_set:
+            counts[nft_set.get("name", "?")] = len(nft_set.get("elem", []))
+    drops: dict[str, int] = {}
+    for name, packets, action in re.findall(r"@([\w.-]+) counter packets (\d+) bytes \d+ (\S+)",
+                                            parts.get("rules", "")):
+        if action != "accept":
+            drops[name] = drops.get(name, 0) + int(packets)
+    res = Result()
+    status = runtime.get("status", "unknown")
+    if status != "active":
+        res.set(CRITICAL)
+    blocking = {name: count for name, count in counts.items()
+                if not name.startswith("allowlist")}
+    total = sum(blocking.values())
+    res.set(evaluate(total, args.warning, args.critical))
+    age = None
+    match = re.search(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d", runtime.get("last_run", ""))
+    try:
+        now = datetime.datetime.strptime(parts.get("now", "").strip(), "%Y-%m-%d %H:%M:%S")
+        age = (now - datetime.datetime.strptime(match.group(0), "%Y-%m-%d %H:%M:%S")).total_seconds()
+    except (AttributeError, ValueError):
+        pass
+    if age is None:
+        res.set(WARNING)
+        run = "last run unknown"
+    else:
+        run = f"last run {fmt_duration(age)} ago"
+        if args.max_age and age > args.max_age:
+            res.set(WARNING)
+            run += f" (more than {fmt_duration(args.max_age)})"
+    feeds = sum(1 for count in blocking.values() if count)
+    res.summary = (f"banIP {status}, {total} block entries in {feeds} "
+                   f"{'list' if feeds == 1 else 'lists'}, {run}")
+    res.perf("block_entries", total, "", args.warning, args.critical, 0)
+    for name in sorted(counts):
+        text = f"{name}: {counts[name]} entries"
+        if name in drops:
+            text += f", {drops[name]} packets blocked"
+            res.perf(f"{name}_blocked", drops[name], "c")
+        res.details.append(f"  {text}")
+        res.perf(name, counts[name], "", "", "", 0)
+    if age is not None:
+        res.perf("last_run_age", int(age), "s", args.max_age or "", "", 0)
+    return res
+
+
 CHECKS = {
     "mem": (script_mem, check_mem, "memory usage in percent", "80", "90"),
     "disk": (script_disk, check_disk, "disk usage in percent (default /overlay)", "80", "90"),
@@ -704,6 +770,8 @@ CHECKS = {
     "updates": (script_updates, check_updates, "number of upgradable packages", "0", ""),
     "inet": (script_inet, check_inet, "internet access from the device: DNS, ping and HTTP(S)",
              "200,20%", "500,60%"),
+    "banip": (script_banip, check_banip, "banIP status, number of block list entries and last run",
+              "", "1:"),
 }
 
 
@@ -797,6 +865,10 @@ def build_parser() -> argparse.ArgumentParser:
         elif name == "updates":
             p.add_argument("-n", "--no-refresh", action="store_true",
                            help="do not refresh the package lists before checking")
+        elif name == "banip":
+            p.add_argument("-a", "--max-age", type=int, default=90000,
+                           help="WARNING if the last banIP run is older, in seconds "
+                                "(default: 90000 = 25 hours, 0 = off)")
         elif name == "inet":
             p.add_argument("-D", "--dns-name", default="openwrt.org",
                            help="name to look up (default: openwrt.org)")
